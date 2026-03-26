@@ -17,9 +17,12 @@
 package snap
 
 import (
+	"time"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/tracker"
 )
 
 // Peer is a collection of relevant information we have about a `snap` peer.
@@ -29,6 +32,7 @@ type Peer struct {
 	*p2p.Peer                   // The embedded P2P package peer
 	rw        p2p.MsgReadWriter // Input/output streams for snap
 	version   uint              // Protocol version negotiated
+	tracker   *tracker.Tracker
 
 	logger log.Logger // Contextual logger with the peer id injected
 }
@@ -36,22 +40,26 @@ type Peer struct {
 // NewPeer creates a wrapper for a network connection and negotiated  protocol
 // version.
 func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter) *Peer {
+	cap := p2p.Cap{Name: ProtocolName, Version: version}
 	id := p.ID().String()
 	return &Peer{
 		id:      id,
 		Peer:    p,
 		rw:      rw,
 		version: version,
+		tracker: tracker.New(cap, id, time.Minute),
 		logger:  log.New("peer", id[:8]),
 	}
 }
 
 // NewFakePeer creates a fake snap peer without a backing p2p peer, for testing purposes.
 func NewFakePeer(version uint, id string, rw p2p.MsgReadWriter) *Peer {
+	cap := p2p.Cap{Name: ProtocolName, Version: version}
 	return &Peer{
 		id:      id,
 		rw:      rw,
 		version: version,
+		tracker: tracker.New(cap, id, time.Minute),
 		logger:  log.New("peer", id[:8]),
 	}
 }
@@ -71,12 +79,24 @@ func (p *Peer) Log() log.Logger {
 	return p.logger
 }
 
+// Close releases resources associated with the peer.
+func (p *Peer) Close() {
+	p.tracker.Stop()
+}
+
 // RequestAccountRange fetches a batch of accounts rooted in a specific account
 // trie, starting with the origin.
 func (p *Peer) RequestAccountRange(id uint64, root common.Hash, origin, limit common.Hash, bytes uint64) error {
 	p.logger.Trace("Fetching range of accounts", "reqid", id, "root", root, "origin", origin, "limit", limit, "bytes", common.StorageSize(bytes))
 
-	requestTracker.Track(p.id, p.version, GetAccountRangeMsg, AccountRangeMsg, id)
+	if err := p.tracker.Track(tracker.Request{
+		ID:       id,
+		ReqCode:  GetAccountRangeMsg,
+		RespCode: AccountRangeMsg,
+		Size:     int(bytes * 2),
+	}); err != nil {
+		return err
+	}
 	return p2p.Send(p.rw, GetAccountRangeMsg, &GetAccountRangePacket{
 		ID:     id,
 		Root:   root,
@@ -95,7 +115,14 @@ func (p *Peer) RequestStorageRanges(id uint64, root common.Hash, accounts []comm
 	} else {
 		p.logger.Trace("Fetching ranges of small storage slots", "reqid", id, "root", root, "accounts", len(accounts), "first", accounts[0], "bytes", common.StorageSize(bytes))
 	}
-	requestTracker.Track(p.id, p.version, GetStorageRangesMsg, StorageRangesMsg, id)
+	if err := p.tracker.Track(tracker.Request{
+		ID:       id,
+		ReqCode:  GetStorageRangesMsg,
+		RespCode: StorageRangesMsg,
+		Size:     int(bytes * 2),
+	}); err != nil {
+		return err
+	}
 	return p2p.Send(p.rw, GetStorageRangesMsg, &GetStorageRangesPacket{
 		ID:       id,
 		Root:     root,
@@ -110,7 +137,14 @@ func (p *Peer) RequestStorageRanges(id uint64, root common.Hash, accounts []comm
 func (p *Peer) RequestByteCodes(id uint64, hashes []common.Hash, bytes uint64) error {
 	p.logger.Trace("Fetching set of byte codes", "reqid", id, "hashes", len(hashes), "bytes", common.StorageSize(bytes))
 
-	requestTracker.Track(p.id, p.version, GetByteCodesMsg, ByteCodesMsg, id)
+	if err := p.tracker.Track(tracker.Request{
+		ID:       id,
+		ReqCode:  GetByteCodesMsg,
+		RespCode: ByteCodesMsg,
+		Size:     len(hashes),
+	}); err != nil {
+		return err
+	}
 	return p2p.Send(p.rw, GetByteCodesMsg, &GetByteCodesPacket{
 		ID:     id,
 		Hashes: hashes,
@@ -123,11 +157,28 @@ func (p *Peer) RequestByteCodes(id uint64, hashes []common.Hash, bytes uint64) e
 func (p *Peer) RequestTrieNodes(id uint64, root common.Hash, paths []TrieNodePathSet, bytes uint64) error {
 	p.logger.Trace("Fetching set of trie nodes", "reqid", id, "root", root, "pathsets", len(paths), "bytes", common.StorageSize(bytes))
 
-	requestTracker.Track(p.id, p.version, GetTrieNodesMsg, TrieNodesMsg, id)
+	if err := p.tracker.Track(tracker.Request{
+		ID:       id,
+		ReqCode:  GetTrieNodesMsg,
+		RespCode: TrieNodesMsg,
+		Size:     countTrieNodePaths(paths),
+	}); err != nil {
+		return err
+	}
 	return p2p.Send(p.rw, GetTrieNodesMsg, &GetTrieNodesPacket{
 		ID:    id,
 		Root:  root,
 		Paths: paths,
 		Bytes: bytes,
 	})
+}
+
+func countTrieNodePaths(paths []TrieNodePathSet) int {
+	total := 0
+	for _, pathset := range paths {
+		if len(pathset) > 0 {
+			total += len(pathset)
+		}
+	}
+	return total
 }
