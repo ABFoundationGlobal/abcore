@@ -29,6 +29,8 @@ import (
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/ethereum/go-ethereum/p2p/tracker"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 )
@@ -81,6 +83,35 @@ type Backend interface {
 	Handle(peer *Peer, packet Packet) error
 }
 
+type getTrieNodesPacketRaw struct {
+	ID    uint64
+	Root  common.Hash
+	Paths rlp.RawValue
+	Bytes uint64
+}
+
+type accountRangePacketRaw struct {
+	ID       uint64
+	Accounts []rlp.RawValue
+	Proof    []rlp.RawValue
+}
+
+type storageRangesPacketRaw struct {
+	ID    uint64
+	Slots []rlp.RawValue
+	Proof []rlp.RawValue
+}
+
+type byteCodesPacketRaw struct {
+	ID    uint64
+	Codes []rlp.RawValue
+}
+
+type trieNodesPacketRaw struct {
+	ID    uint64
+	Nodes []rlp.RawValue
+}
+
 // MakeProtocols constructs the P2P protocol definitions for `snap`.
 func MakeProtocols(backend Backend, dnsdisc enode.Iterator) []p2p.Protocol {
 	// Filter the discovery iterator for nodes advertising snap support.
@@ -99,6 +130,7 @@ func MakeProtocols(backend Backend, dnsdisc enode.Iterator) []p2p.Protocol {
 			Length:  protocolLengths[version],
 			Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 				return backend.RunPeer(NewPeer(version, p, rw), func(peer *Peer) error {
+					defer peer.Close()
 					return Handle(backend, peer)
 				})
 			},
@@ -171,20 +203,35 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == AccountRangeMsg:
-		// A range of accounts arrived to one of our previous requests
-		res := new(AccountRangePacket)
+		res := new(accountRangePacketRaw)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+		if len(res.Proof) > 128 {
+			return fmt.Errorf("AccountRange: invalid proof (length %d)", len(res.Proof))
+		}
+		if err := peer.tracker.Fulfil(tracker.Response{
+			ID:      res.ID,
+			MsgCode: AccountRangeMsg,
+			Size:    rawValuesSize(res.Accounts) + rawValuesSize(res.Proof),
+		}); err != nil {
+			return fmt.Errorf("AccountRange: %w", err)
+		}
+		accounts, err := decodeAccounts(res.Accounts)
+		if err != nil {
+			return fmt.Errorf("AccountRange: %w", err)
+		}
+		proof, err := decodeBytesList(res.Proof)
+		if err != nil {
+			return fmt.Errorf("AccountRange: %w", err)
+		}
 		// Ensure the range is monotonically increasing
-		for i := 1; i < len(res.Accounts); i++ {
-			if bytes.Compare(res.Accounts[i-1].Hash[:], res.Accounts[i].Hash[:]) >= 0 {
-				return fmt.Errorf("accounts not monotonically increasing: #%d [%x] vs #%d [%x]", i-1, res.Accounts[i-1].Hash[:], i, res.Accounts[i].Hash[:])
+		for i := 1; i < len(accounts); i++ {
+			if bytes.Compare(accounts[i-1].Hash[:], accounts[i].Hash[:]) >= 0 {
+				return fmt.Errorf("accounts not monotonically increasing: #%d [%x] vs #%d [%x]", i-1, accounts[i-1].Hash[:], i, accounts[i].Hash[:])
 			}
 		}
-		requestTracker.Fulfil(peer.id, peer.version, AccountRangeMsg, res.ID)
-
-		return backend.Handle(peer, res)
+		return backend.Handle(peer, &AccountRangePacket{ID: res.ID, Accounts: accounts, Proof: proof})
 
 	case msg.Code == GetStorageRangesMsg:
 		// Decode the storage retrieval request
@@ -203,22 +250,37 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == StorageRangesMsg:
-		// A range of storage slots arrived to one of our previous requests
-		res := new(StorageRangesPacket)
+		res := new(storageRangesPacketRaw)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+		if len(res.Proof) > 128 {
+			return fmt.Errorf("StorageRanges: invalid proof (length %d)", len(res.Proof))
+		}
+		if err := peer.tracker.Fulfil(tracker.Response{
+			ID:      res.ID,
+			MsgCode: StorageRangesMsg,
+			Size:    rawValuesSize(res.Slots) + rawValuesSize(res.Proof),
+		}); err != nil {
+			return fmt.Errorf("StorageRanges: %w", err)
+		}
+		slotsList, err := decodeStorageRanges(res.Slots)
+		if err != nil {
+			return fmt.Errorf("StorageRanges: %w", err)
+		}
+		proof, err := decodeBytesList(res.Proof)
+		if err != nil {
+			return fmt.Errorf("StorageRanges: %w", err)
+		}
 		// Ensure the ranges are monotonically increasing
-		for i, slots := range res.Slots {
+		for i, slots := range slotsList {
 			for j := 1; j < len(slots); j++ {
 				if bytes.Compare(slots[j-1].Hash[:], slots[j].Hash[:]) >= 0 {
 					return fmt.Errorf("storage slots not monotonically increasing for account #%d: #%d [%x] vs #%d [%x]", i, j-1, slots[j-1].Hash[:], j, slots[j].Hash[:])
 				}
 			}
 		}
-		requestTracker.Fulfil(peer.id, peer.version, StorageRangesMsg, res.ID)
-
-		return backend.Handle(peer, res)
+		return backend.Handle(peer, &StorageRangesPacket{ID: res.ID, Slots: slotsList, Proof: proof})
 
 	case msg.Code == GetByteCodesMsg:
 		// Decode bytecode retrieval request
@@ -236,23 +298,30 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == ByteCodesMsg:
-		// A batch of byte codes arrived to one of our previous requests
-		res := new(ByteCodesPacket)
+		res := new(byteCodesPacketRaw)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
-		requestTracker.Fulfil(peer.id, peer.version, ByteCodesMsg, res.ID)
-
-		return backend.Handle(peer, res)
+		if err := peer.tracker.Fulfil(tracker.Response{
+			ID:      res.ID,
+			MsgCode: ByteCodesMsg,
+			Size:    len(res.Codes),
+		}); err != nil {
+			return fmt.Errorf("ByteCodes: %w", err)
+		}
+		codes, err := decodeBytesList(res.Codes)
+		if err != nil {
+			return fmt.Errorf("ByteCodes: %w", err)
+		}
+		return backend.Handle(peer, &ByteCodesPacket{ID: res.ID, Codes: codes})
 
 	case msg.Code == GetTrieNodesMsg:
-		// Decode trie node retrieval request
-		var req GetTrieNodesPacket
+		var req getTrieNodesPacketRaw
 		if err := msg.Decode(&req); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
 		// Service the request, potentially returning nothing in case of errors
-		nodes, err := ServiceGetTrieNodesQuery(backend.Chain(), &req, start)
+		nodes, err := ServiceGetTrieNodesQueryRaw(backend.Chain(), &req, start)
 		if err != nil {
 			return err
 		}
@@ -263,14 +332,22 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == TrieNodesMsg:
-		// A batch of trie nodes arrived to one of our previous requests
-		res := new(TrieNodesPacket)
+		res := new(trieNodesPacketRaw)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
-		requestTracker.Fulfil(peer.id, peer.version, TrieNodesMsg, res.ID)
-
-		return backend.Handle(peer, res)
+		if err := peer.tracker.Fulfil(tracker.Response{
+			ID:      res.ID,
+			MsgCode: TrieNodesMsg,
+			Size:    len(res.Nodes),
+		}); err != nil {
+			return fmt.Errorf("TrieNodes: %w", err)
+		}
+		nodes, err := decodeBytesList(res.Nodes)
+		if err != nil {
+			return fmt.Errorf("TrieNodes: %w", err)
+		}
+		return backend.Handle(peer, &TrieNodesPacket{ID: res.ID, Nodes: nodes})
 
 	default:
 		return fmt.Errorf("%w: %v", errInvalidMsgCode, msg.Code)
@@ -483,6 +560,20 @@ func ServiceGetByteCodesQuery(chain *core.BlockChain, req *GetByteCodesPacket) [
 // ServiceGetTrieNodesQuery assembles the response to a trie nodes query.
 // It is exposed to allow external packages to test protocol behavior.
 func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, start time.Time) ([][]byte, error) {
+	paths, err := rlp.EncodeToBytes(req.Paths)
+	if err != nil {
+		return nil, err
+	}
+	return ServiceGetTrieNodesQueryRaw(chain, &getTrieNodesPacketRaw{
+		ID:    req.ID,
+		Root:  req.Root,
+		Paths: paths,
+		Bytes: req.Bytes,
+	}, start)
+}
+
+// ServiceGetTrieNodesQueryRaw assembles the response to a trie nodes query from raw RLP paths.
+func ServiceGetTrieNodesQueryRaw(chain *core.BlockChain, req *getTrieNodesPacketRaw, start time.Time) ([][]byte, error) {
 	if req.Bytes > softResponseLimit {
 		req.Bytes = softResponseLimit
 	}
@@ -502,7 +593,26 @@ func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, s
 		bytes uint64
 		loads int // Trie hash expansions to count database reads
 	)
-	for _, pathset := range req.Paths {
+	outer, err := rlp.NewListIterator(req.Paths)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid trie path list: %v", errBadRequest, err)
+	}
+	for outer.Next() {
+		inner, err := rlp.NewListIterator(outer.Value())
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid pathset: %v", errBadRequest, err)
+		}
+		var pathset [][]byte
+		for inner.Next() {
+			path, _, err := rlp.SplitString(inner.Value())
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid trie path: %v", errBadRequest, err)
+			}
+			pathset = append(pathset, path)
+		}
+		if err := inner.Err(); err != nil {
+			return nil, err
+		}
 		switch len(pathset) {
 		case 0:
 			// Ensure we penalize invalid requests
@@ -564,7 +674,50 @@ func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, s
 			break
 		}
 	}
+	if err := outer.Err(); err != nil {
+		return nil, err
+	}
 	return nodes, nil
+}
+
+func rawValuesSize(items []rlp.RawValue) int {
+	size := 0
+	for _, item := range items {
+		size += len(item)
+	}
+	return size
+}
+
+func decodeBytesList(items []rlp.RawValue) ([][]byte, error) {
+	out := make([][]byte, len(items))
+	for i, item := range items {
+		if err := rlp.DecodeBytes(item, &out[i]); err != nil {
+			return nil, fmt.Errorf("invalid item %d: %v", i, err)
+		}
+	}
+	return out, nil
+}
+
+func decodeAccounts(items []rlp.RawValue) ([]*AccountData, error) {
+	out := make([]*AccountData, len(items))
+	for i, item := range items {
+		var account AccountData
+		if err := rlp.DecodeBytes(item, &account); err != nil {
+			return nil, fmt.Errorf("invalid account %d: %v", i, err)
+		}
+		out[i] = &account
+	}
+	return out, nil
+}
+
+func decodeStorageRanges(items []rlp.RawValue) ([][]*StorageData, error) {
+	out := make([][]*StorageData, len(items))
+	for i, item := range items {
+		if err := rlp.DecodeBytes(item, &out[i]); err != nil {
+			return nil, fmt.Errorf("invalid storage list %d: %v", i, err)
+		}
+	}
+	return out, nil
 }
 
 // NodeInfo represents a short summary of the `snap` sub-protocol metadata
